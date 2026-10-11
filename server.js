@@ -1,9 +1,9 @@
 /**
  * Vérificateur de numéros WhatsApp
  * - Dit si un numéro est toujours disponible sur WhatsApp, ou introuvable / plus disponible
- * - Garde l'historique (date/heure de la dernière fois actif, date/heure où il a disparu)
- * - Peut surveiller des numéros automatiquement
- * Utilise un numéro WhatsApp "vérificateur" lié par code (Baileys).
+ * - Garde l'historique (dernière fois vu actif, date/heure où il a disparu)
+ * - Surveillance automatique de numéros
+ * - Mot de passe créé au premier accès (rien à configurer)
  */
 import express from 'express';
 import crypto from 'crypto';
@@ -16,27 +16,79 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = env.DATA_DIR || path.join(__dirname, 'data');
 const AUTH_DIR = path.join(DATA_DIR, 'auth');
 const DB_FILE = path.join(DATA_DIR, 'history.json');
+const SET_FILE = path.join(DATA_DIR, 'settings.json');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DEMO = env.DEMO_MODE === '1';
-const PASSWORD = env.ADMIN_PASSWORD || '';
 const DAILY_LIMIT = Number(env.DAILY_LIMIT || 300); // vérifications max par jour (protège ton numéro)
 const WATCH_EVERY_MIN = Number(env.CHECK_INTERVAL_MIN || 30);
 const MAX_PER_REQUEST = 20;
+const UP_URL = env.UPSTASH_REDIS_REST_URL;
+const UP_TOKEN = env.UPSTASH_REDIS_REST_TOKEN;
+const REMOTE = !!(UP_URL && UP_TOKEN);
+const EPHEMERAL = !REMOTE && !!env.RENDER; // hébergeur gratuit qui efface les fichiers
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/* ======================= Historique (fichier JSON) ======================= */
-let db = { numbers: {}, daily: {} };
-try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { /* premier démarrage */ }
-db.numbers = db.numbers || {};
-db.daily = db.daily || {};
-function save() {
-  try {
-    fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db));
-    fs.renameSync(DB_FILE + '.tmp', DB_FILE);
-  } catch (e) { console.error('Sauvegarde impossible', e.message); }
+process.on('unhandledRejection', (e) => console.error('Erreur non gérée :', e && e.message ? e.message : e));
+process.on('uncaughtException', (e) => console.error('Exception :', e && e.message ? e.message : e));
+
+/* ======================= Stockage : Upstash (permanent) ou fichiers ======================= */
+async function rcmd(args) {
+  const r = await fetch(UP_URL, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + UP_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(args),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d.result;
 }
 
+let db = { numbers: {}, daily: {} };
+let settings = {};
+
+async function loadState() {
+  try {
+    if (REMOTE) {
+      const a = await rcmd(['GET', 'vw:db']);
+      if (a) db = JSON.parse(a);
+      const b = await rcmd(['GET', 'vw:settings']);
+      if (b) settings = JSON.parse(b);
+    } else {
+      try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { /* premier démarrage */ }
+      try { settings = JSON.parse(fs.readFileSync(SET_FILE, 'utf8')); } catch (e) { /* premier démarrage */ }
+    }
+  } catch (e) {
+    console.error('Lecture du stockage impossible :', e.message);
+  }
+  db.numbers = db.numbers || {};
+  db.daily = db.daily || {};
+  if (!settings.secret) { settings.secret = crypto.randomBytes(32).toString('hex'); save(); }
+}
+
+let saveTimer = null;
+export async function flush() {
+  saveTimer = null;
+  const d = JSON.stringify(db);
+  const s = JSON.stringify(settings);
+  try {
+    if (REMOTE) {
+      await rcmd(['SET', 'vw:db', d]);
+      await rcmd(['SET', 'vw:settings', s]);
+    } else {
+      fs.writeFileSync(DB_FILE + '.tmp', d);
+      fs.renameSync(DB_FILE + '.tmp', DB_FILE);
+      fs.writeFileSync(SET_FILE + '.tmp', s);
+      fs.renameSync(SET_FILE + '.tmp', SET_FILE);
+    }
+  } catch (e) { console.error('Sauvegarde impossible :', e.message); }
+}
+function save() { if (!saveTimer) saveTimer = setTimeout(flush, 300); }
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { await flush(); process.exit(0); });
+
+await loadState();
+
+/* ======================= Outils ======================= */
 const fmt = (ms) =>
   ms ? new Date(ms).toLocaleString('fr-FR', { timeZone: 'Africa/Libreville', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' (heure du Gabon)' : '—';
 
@@ -100,7 +152,7 @@ function view(rec) {
   } else {
     state = 'notfound';
     headline = '❓ Numéro introuvable sur WhatsApp';
-    lines.push("Jamais vu actif depuis le 1er contrôle du " + fmt(rec.firstChecked) + ". Il n'est pas inscrit, ou il était déjà banni.");
+    lines.push('Jamais vu actif depuis le 1er contrôle du ' + fmt(rec.firstChecked) + ". Il n'est pas inscrit, ou il était déjà banni.");
     lines.push('Vérifié le : ' + fmt(rec.lastChecked));
   }
   return {
@@ -114,32 +166,84 @@ const wa = { status: 'disconnected', qr: null, qrReady: false, me: null, pairing
 let sock = null;
 let starting = false;
 
+async function clearAuth() {
+  try {
+    if (REMOTE) {
+      const keys = await rcmd(['KEYS', 'vw:auth:*']);
+      for (const k of keys || []) await rcmd(['DEL', k]);
+    } else {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    }
+  } catch (e) { console.error('Effacement de la liaison impossible :', e.message); }
+}
+
+/** Sauvegarde de la liaison WhatsApp : fichiers, ou Upstash si configuré (survit aux redémarrages). */
+async function makeAuthState(B) {
+  const get = (k) => B[k] || (B.default && B.default[k]);
+  if (!REMOTE) return await get('useMultiFileAuthState')(AUTH_DIR);
+  const initAuthCreds = get('initAuthCreds');
+  const BufferJSON = get('BufferJSON');
+  const proto = get('proto');
+  const P = 'vw:auth:';
+  const read = async (k) => { const v = await rcmd(['GET', P + k]); return v ? JSON.parse(v, BufferJSON.reviver) : null; };
+  const write = (k, d) => rcmd(['SET', P + k, JSON.stringify(d, BufferJSON.replacer)]);
+  const del = (k) => rcmd(['DEL', P + k]);
+  const creds = (await read('creds')) || initAuthCreds();
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const out = {};
+          await Promise.all(ids.map(async (id) => {
+            let v = await read(type + '-' + id);
+            if (type === 'app-state-sync-key' && v && proto) v = proto.Message.AppStateSyncKeyData.fromObject(v);
+            out[id] = v;
+          }));
+          return out;
+        },
+        set: async (data) => {
+          const tasks = [];
+          for (const cat in data) for (const id in data[cat]) {
+            const v = data[cat][id];
+            tasks.push(v ? write(cat + '-' + id, v) : del(cat + '-' + id));
+          }
+          await Promise.all(tasks);
+        },
+      },
+    },
+    saveCreds: () => write('creds', creds),
+  };
+}
+
 async function startWA() {
   if (starting) return;
   starting = true;
+  if (DEMO) {
+    // MODE DÉMO : pas de vrai WhatsApp. Fin en 0 = "introuvable". Fin en 9 = actif au 1er contrôle puis "banni".
+    wa.status = 'connected';
+    wa.me = 'DEMO';
+    const seen9 = new Set();
+    sock = {
+      onWhatsApp: async (jid) => {
+        const n = jid.split('@')[0];
+        let exists = !n.endsWith('0');
+        if (n.endsWith('9')) { exists = !seen9.has(n); seen9.add(n); }
+        return [{ jid, exists }];
+      },
+      requestPairingCode: async () => 'DEMO1234',
+    };
+    wa.qrReady = true;
+    return;
+  }
   try {
-    if (DEMO) {
-      // MODE DÉMO : pas de vrai WhatsApp. Fin en 0 = "introuvable". Fin en 9 = actif au 1er contrôle puis "banni".
-      wa.status = 'connected';
-      wa.me = 'DEMO';
-      const seen9 = new Set();
-      sock = {
-        onWhatsApp: async (jid) => {
-          const n = jid.split('@')[0];
-          let exists = !n.endsWith('0');
-          if (n.endsWith('9')) { exists = !seen9.has(n); seen9.add(n); }
-          return [{ jid, exists }];
-        },
-      };
-      return;
-    }
     const B = await import('@whiskeysockets/baileys');
     const get = (k) => B[k] || (B.default && B.default[k]);
     const make = typeof B.default === 'function' ? B.default : (B.makeWASocket || (B.default && B.default.default));
     const pino = (await import('pino')).default;
     const QRCode = (await import('qrcode')).default;
 
-    const { state, saveCreds } = await get('useMultiFileAuthState')(AUTH_DIR);
+    const { state, saveCreds } = await makeAuthState(B);
     let version;
     try { version = (await get('fetchLatestBaileysVersion')()).version; } catch (e) { /* version par défaut */ }
 
@@ -173,9 +277,12 @@ async function startWA() {
       }
       if (connection === 'close') {
         wa.status = 'disconnected';
+        wa.qr = null;
+        wa.qrReady = false;
+        wa.pairing = null;
         const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
         const DR = get('DisconnectReason') || {};
-        if (code === DR.loggedOut) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        if (code === DR.loggedOut) await clearAuth();
         starting = false;
         setTimeout(startWA, 3000);
       }
@@ -183,39 +290,37 @@ async function startWA() {
   } catch (e) {
     console.error('Démarrage WhatsApp impossible :', e.message);
     wa.status = 'error';
-    setTimeout(() => { starting = false; startWA(); }, 15000);
-    return;
-  } finally {
-    if (DEMO || wa.status === 'connecting' || wa.status === 'connected') { /* garde starting=true tant que le socket vit */ }
+    starting = false;
+    setTimeout(startWA, 15000);
   }
 }
 
 async function requestPairing(phone) {
-  if (DEMO) return 'DEMO-1234';
-  if (wa.status === 'connected') throw new Error('Déjà connecté à WhatsApp.');
+  if (wa.status === 'connected' && !DEMO) throw new Error('Déjà connecté à WhatsApp.');
   for (let i = 0; i < 40 && !wa.qrReady; i++) await sleep(500);
-  if (!wa.qrReady || !sock) throw new Error('Connexion à WhatsApp pas encore prête, réessaie dans quelques secondes.');
+  if (!wa.qrReady || !sock) throw new Error('La connexion à WhatsApp n’est pas encore prête. Attends 10 secondes et réessaie.');
   const code = await sock.requestPairingCode(phone.replace('+', ''));
   wa.pairing = code;
   return code;
 }
 
 async function lookup(number) {
-  if (wa.status !== 'connected' || !sock) throw new Error('WhatsApp du vérificateur non connecté.');
+  if (wa.status !== 'connected' || !sock) throw new Error('Le WhatsApp du vérificateur n’est pas connecté.');
   const r = await sock.onWhatsApp(number.replace('+', '') + '@s.whatsapp.net');
   return !!(r && r[0] && r[0].exists);
 }
 
 /* ======================= Limites quotidiennes ======================= */
+const today = () => new Date().toISOString().slice(0, 10);
 function useQuota(n) {
-  const day = new Date().toISOString().slice(0, 10);
+  const day = today();
   db.daily = { [day]: db.daily[day] || 0 };
   if (db.daily[day] + n > DAILY_LIMIT) return false;
   db.daily[day] += n;
   save();
   return true;
 }
-const usedToday = () => db.daily[new Date().toISOString().slice(0, 10)] || 0;
+const usedToday = () => db.daily[today()] || 0;
 
 /* ======================= Surveillance automatique ======================= */
 let watching = false;
@@ -233,35 +338,58 @@ async function watchLoop() {
 }
 setInterval(watchLoop, WATCH_EVERY_MIN * 60 * 1000);
 
+// Évite que l'hébergeur gratuit endorme le site (il s'endort après 15 min sans visite)
+const SELF_URL = env.RENDER_EXTERNAL_URL || env.KEEPALIVE_URL;
+if (SELF_URL && !DEMO) setInterval(() => fetch(SELF_URL + '/healthz').catch(() => {}), 10 * 60 * 1000);
+
+/* ======================= Mot de passe & sessions ======================= */
+const safeEq = (a, b) =>
+  crypto.timingSafeEqual(crypto.createHash('sha256').update(String(a)).digest(), crypto.createHash('sha256').update(String(b)).digest());
+const hashPass = (p, salt) => crypto.scryptSync(p, salt, 32).toString('hex');
+const passwordSet = () => !!(env.ADMIN_PASSWORD || settings.passHash);
+function checkPass(p) {
+  if (env.ADMIN_PASSWORD) return safeEq(p, env.ADMIN_PASSWORD);
+  if (!settings.passHash) return false;
+  return safeEq(hashPass(String(p), settings.salt), settings.passHash);
+}
+const hmac = (s) => crypto.createHmac('sha256', settings.secret).update(s).digest('base64url');
+function makeSession() {
+  const body = Buffer.from(JSON.stringify({ exp: Date.now() + 30 * 86400000 })).toString('base64url');
+  return body + '.' + hmac(body);
+}
+function getCookie(req, name) {
+  for (const p of String((req.headers && req.headers.cookie) || '').split(';')) {
+    const i = p.indexOf('=');
+    if (i > 0 && p.slice(0, i).trim() === name) return decodeURIComponent(p.slice(i + 1).trim());
+  }
+  return null;
+}
+function authed(req) {
+  const t = getCookie(req, 'vsess');
+  if (!t) return false;
+  const [body, sig] = t.split('.');
+  if (!body || !sig) return false;
+  const exp = hmac(body);
+  if (sig.length !== exp.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(exp))) return false;
+  try { return JSON.parse(Buffer.from(body, 'base64url').toString()).exp > Date.now(); } catch (e) { return false; }
+}
+const cookie = (req, value, maxAge) =>
+  'vsess=' + encodeURIComponent(value) + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + maxAge + (String(req.headers['x-forwarded-proto'] || '') === 'https' ? '; Secure' : '');
+
 /* ======================= Serveur web ======================= */
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '20kb' }));
 
-const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
-const failures = new Map();
 const ipOf = (req) => String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
+const failures = new Map();
 
-app.get('/healthz', (req, res) => res.type('text').send('ok'));
-
-function auth(req, res, next) {
-  if (!PASSWORD) return res.status(503).type('text').send('Définis la variable ADMIN_PASSWORD pour activer le site.');
-  const ip = ipOf(req);
-  const f = failures.get(ip);
-  if (f && f.n >= 10 && Date.now() - f.t < 10 * 60 * 1000) return res.status(429).type('text').send('Trop de tentatives. Réessaie dans 10 minutes.');
-  const [type, val] = String(req.headers.authorization || '').split(' ');
-  if (type === 'Basic' && val) {
-    const pass = Buffer.from(val, 'base64').toString().split(':').slice(1).join(':');
-    if (crypto.timingSafeEqual(sha(pass), sha(PASSWORD))) { failures.delete(ip); return next(); }
-    failures.set(ip, { n: ((f && Date.now() - f.t < 10 * 60 * 1000 ? f.n : 0) + 1), t: Date.now() });
-  }
-  res.set('WWW-Authenticate', 'Basic realm="Verification"').status(401).type('text').send('Authentification requise');
-}
-app.use(auth);
-
-// Protection contre les requêtes venant d'autres sites
 app.use((req, res, next) => {
+  const p = req.path || String(req.url || '/').split('?')[0];
+  if (p === '/healthz') return next();
   if (req.method !== 'GET' && req.headers['x-requested-with'] !== 'verif') return res.status(403).json({ ok: false, message: 'Requête refusée.' });
+  if (p === '/' || p === '/api/setup' || p === '/api/login') return next();
+  if (!authed(req)) return res.status(401).json({ ok: false, auth: true, message: 'Connecte-toi.' });
   next();
 });
 
@@ -270,11 +398,46 @@ const wrap = (fn) => (req, res) => fn(req, res).catch((e) => {
   res.status(500).json({ ok: false, message: e.message || 'Erreur serveur.' });
 });
 
-app.get('/', (req, res) => res.set('Content-Type', 'text/html; charset=utf-8').send(PAGE));
+app.get('/healthz', (req, res) => res.type('text').send('ok'));
+
+app.get('/', (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(!passwordSet() ? SETUP_PAGE : !authed(req) ? LOGIN_PAGE : MAIN_PAGE);
+});
+
+app.post('/api/setup', (req, res) => {
+  if (passwordSet()) return res.status(403).json({ ok: false, message: 'Un mot de passe existe déjà.' });
+  const p = String((req.body && req.body.password) || '');
+  if (p.length < 6) return res.status(400).json({ ok: false, message: 'Le mot de passe doit faire au moins 6 caractères.' });
+  settings.salt = crypto.randomBytes(16).toString('hex');
+  settings.passHash = hashPass(p, settings.salt);
+  save();
+  res.set('Set-Cookie', cookie(req, makeSession(), 30 * 86400));
+  res.json({ ok: true });
+});
+
+app.post('/api/login', (req, res) => {
+  const ip = ipOf(req);
+  const f = failures.get(ip);
+  if (f && f.n >= 8 && Date.now() - f.t < 10 * 60 * 1000) return res.status(429).json({ ok: false, message: 'Trop d’essais. Réessaie dans 10 minutes.' });
+  if (!passwordSet()) return res.status(400).json({ ok: false, message: 'Aucun mot de passe défini.' });
+  if (!checkPass((req.body && req.body.password) || '')) {
+    failures.set(ip, { n: (f && Date.now() - f.t < 10 * 60 * 1000 ? f.n : 0) + 1, t: Date.now() });
+    return res.status(401).json({ ok: false, message: 'Mot de passe incorrect.' });
+  }
+  failures.delete(ip);
+  res.set('Set-Cookie', cookie(req, makeSession(), 30 * 86400));
+  res.json({ ok: true });
+});
+
+app.post('/api/logout', (req, res) => {
+  res.set('Set-Cookie', cookie(req, '', 0));
+  res.json({ ok: true });
+});
 
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ demo: DEMO, status: wa.status, me: wa.me, qr: wa.qr, pairing: wa.pairing, usedToday: usedToday(), dailyLimit: DAILY_LIMIT, watchEveryMin: WATCH_EVERY_MIN });
+  res.json({ demo: DEMO, ephemeral: EPHEMERAL, status: wa.status, me: wa.me, qr: wa.qr, pairing: wa.pairing, usedToday: usedToday(), dailyLimit: DAILY_LIMIT });
 });
 
 app.post('/api/pair', wrap(async (req, res) => {
@@ -290,17 +453,24 @@ app.post('/api/check', wrap(async (req, res) => {
   const numbers = [...new Set(raw.map(normalizePhone).filter(Boolean))];
   if (!numbers.length) return res.status(400).json({ ok: false, message: 'Aucun numéro valide. Utilise le format international, ex : +241 07 12 34 56.' });
   if (numbers.length > MAX_PER_REQUEST) return res.status(400).json({ ok: false, message: 'Maximum ' + MAX_PER_REQUEST + ' numéros à la fois.' });
-  if (wa.status !== 'connected') return res.status(409).json({ ok: false, message: "Le WhatsApp du vérificateur n'est pas connecté. Lie-le d'abord (étape 1)." });
-  if (!useQuota(numbers.length)) return res.status(429).json({ ok: false, message: 'Limite de ' + DAILY_LIMIT + ' vérifications par jour atteinte (protège ton numéro). Réessaie demain.' });
+  if (wa.status !== 'connected') return res.status(409).json({ ok: false, message: 'Le WhatsApp du vérificateur n’est pas connecté. Fais d’abord l’étape 1.' });
+  if (!useQuota(numbers.length)) return res.status(429).json({ ok: false, message: 'Limite de ' + DAILY_LIMIT + ' vérifications par jour atteinte (elle protège ton numéro). Réessaie demain.' });
 
   const results = [];
+  let warning = '';
   for (let i = 0; i < numbers.length; i++) {
-    const rec = record(numbers[i], await lookup(numbers[i]));
-    if (watch) { rec.watch = true; save(); }
-    results.push(view(rec));
+    try {
+      const rec = record(numbers[i], await lookup(numbers[i]));
+      if (watch) { rec.watch = true; save(); }
+      results.push(view(rec));
+    } catch (e) {
+      warning = 'WhatsApp a refusé la vérification (' + (e.message || 'erreur') + '). Les numéros restants n’ont pas été vérifiés : réessaie dans quelques minutes.';
+      break;
+    }
     if (i < numbers.length - 1) await sleep(DEMO ? 0 : 1200 + Math.random() * 1800);
   }
-  res.json({ ok: true, results });
+  if (!results.length) return res.status(502).json({ ok: false, message: warning });
+  res.json({ ok: true, results, warning });
 }));
 
 app.get('/api/history', (req, res) => {
@@ -323,12 +493,8 @@ app.delete('/api/number', (req, res) => {
   res.json({ ok: true });
 });
 
-/* ======================= Page web ======================= */
-const PAGE = `<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vérificateur de numéros WhatsApp</title>
-<style>
+/* ======================= Pages web ======================= */
+const CSS = `
 :root{--bg:#0b141a;--card:#111b21;--line:#233138;--text:#e9edef;--muted:#8696a0;--g:#25d366;--r:#ff5c5c;--o:#ffb020}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;line-height:1.5}
 .wrap{max-width:760px;margin:0 auto;padding:16px 16px 60px}h1{font-size:24px;margin:8px 0 4px}h2{font-size:17px;margin:0 0 10px}
@@ -347,24 +513,70 @@ input:focus,textarea:focus{outline:2px solid var(--g)}
 .res ul{margin:6px 0 0;padding-left:18px;font-size:13px;color:#c5d0d6}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .code{font-size:30px;letter-spacing:4px;font-weight:800;text-align:center;background:#0b141a;border:1px dashed var(--g);border-radius:12px;padding:12px;margin:10px 0}
-.error{color:var(--r);font-size:14px}.hidden{display:none}.demo{background:rgba(255,176,32,.15);border:1px solid var(--o);color:var(--o);padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:10px}
+.error{color:var(--r);font-size:14px}.hidden{display:none}
+.note{background:rgba(255,176,32,.12);border:1px solid var(--o);color:var(--o);padding:8px 12px;border-radius:10px;font-size:13px;margin-bottom:10px}
 label.chk{display:flex;gap:8px;align-items:center;font-size:14px;margin-bottom:10px}label.chk input{width:auto;margin:0}
 img.qr{display:block;margin:10px auto;max-width:260px;background:#fff;padding:8px;border-radius:12px}
-</style></head><body><div class="wrap">
-<h1>🔎 Vérificateur de numéros WhatsApp</h1>
-<p class="muted">Vois si un numéro est toujours disponible, ou s'il a disparu (banni, supprimé), avec la date et l'heure.</p>
-<div id="demo" class="demo hidden">MODE DÉMO : résultats simulés. Numéro finissant par 0 = introuvable ; finissant par 9 = actif au 1er contrôle puis « banni » au suivant.</div>
+.top{display:flex;justify-content:space-between;align-items:center}
+`;
 
-<section class="card" id="conn">
+const COMMON_JS = String.raw`
+var H = { 'Content-Type': 'application/json', 'X-Requested-With': 'verif' };
+function $(id) { return document.getElementById(id); }
+function api(url, method, body) {
+  return fetch(url, { method: method || 'GET', headers: H, credentials: 'same-origin', body: body ? JSON.stringify(body) : undefined })
+    .then(function (r) { return r.json(); })
+    .then(function (d) { if (d && d.auth) { location.reload(); } return d; });
+}
+function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function setHidden(id, hide) { var e = $(id); var c = e.className.replace(/\s*hidden/g, ''); e.className = hide ? (c + ' hidden').trim() : c; }
+`;
+
+const head = (title) => `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title><style>${CSS}</style></head><body>`;
+
+const SETUP_PAGE = head('Vérificateur WhatsApp') + `<div class="wrap">
+<h1>🔎 Vérificateur de numéros WhatsApp</h1>
+<div class="card"><h2>Bienvenue ! Crée ton mot de passe</h2>
+<p class="muted">C'est ta première visite. Choisis un mot de passe (6 caractères minimum) : il protégera ton site. Garde-le bien.</p>
+<input id="p1" type="password" placeholder="Mot de passe" autocomplete="new-password">
+<input id="p2" type="password" placeholder="Confirme le mot de passe" autocomplete="new-password">
+<button class="btn" id="go">Créer et entrer</button><p class="error" id="err"></p></div></div>
+<script>${COMMON_JS}
+$('go').onclick = function () {
+  $('err').textContent = '';
+  if ($('p1').value.length < 6) return ($('err').textContent = 'Au moins 6 caractères.');
+  if ($('p1').value !== $('p2').value) return ($('err').textContent = 'Les deux mots de passe sont différents.');
+  api('/api/setup', 'POST', { password: $('p1').value }).then(function (d) { if (d.ok) location.reload(); else $('err').textContent = d.message; });
+};
+</script></body></html>`;
+
+const LOGIN_PAGE = head('Connexion') + `<div class="wrap">
+<h1>🔎 Vérificateur de numéros WhatsApp</h1>
+<div class="card"><h2>Connexion</h2>
+<input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password">
+<button class="btn" id="go">Entrer</button><p class="error" id="err"></p></div></div>
+<script>${COMMON_JS}
+function login() { $('err').textContent = ''; api('/api/login', 'POST', { password: $('p').value }).then(function (d) { if (d.ok) location.reload(); else $('err').textContent = d.message; }); }
+$('go').onclick = login;
+$('p').onkeydown = function (e) { if (e.key === 'Enter') login(); };
+</script></body></html>`;
+
+const MAIN_PAGE = head('Vérificateur de numéros WhatsApp') + `<div class="wrap">
+<div class="top"><h1>🔎 Vérificateur WhatsApp</h1><button class="btn small ghost" id="logout">Déconnexion</button></div>
+<p class="muted">Vois si un numéro est toujours disponible, ou s'il a disparu (banni, supprimé), avec la date et l'heure.</p>
+<div id="demo" class="note hidden">MODE DÉMO : résultats simulés. Numéro finissant par 0 = introuvable ; finissant par 9 = actif au 1er contrôle puis « banni » au suivant.</div>
+<div id="eph" class="note hidden">Stockage temporaire : si le site redémarre, il faudra relier WhatsApp à nouveau et l'historique sera effacé. Pour tout garder, ajoute la base gratuite Upstash (voir le guide LISEZ-MOI).</div>
+
+<section class="card">
   <h2>1. WhatsApp du vérificateur <span id="badge" class="badge b-wait">…</span></h2>
   <div id="connOk" class="hidden"><p class="muted">Connecté avec le numéro <strong id="me"></strong>. Vérifications aujourd'hui : <span id="quota"></span>.</p></div>
   <div id="connNo" class="hidden">
-    <p class="muted">Utilise un numéro WhatsApp secondaire (pas ton numéro principal) pour ce rôle. Entre-le pour obtenir un code de liaison.</p>
+    <p class="muted">Utilise un numéro WhatsApp secondaire (pas ton numéro principal). Entre-le ici pour obtenir un code de liaison.</p>
     <input id="pairPhone" type="tel" inputmode="tel" placeholder="+241 07 12 34 56">
     <button class="btn" id="pairBtn">Obtenir le code de liaison</button>
     <div id="pairBox" class="hidden">
       <div class="code" id="pairCode"></div>
-      <p class="muted">Sur ce téléphone : WhatsApp → ⋮ → Appareils connectés → Connecter un appareil → <strong>Associer avec le numéro de téléphone</strong> → tape ce code.</p>
+      <p class="muted">Sur ce téléphone, <strong>dans la minute</strong> : WhatsApp → ⋮ → Appareils connectés → Connecter un appareil → <strong>Associer avec le numéro de téléphone</strong> → tape ce code.</p>
     </div>
     <img id="qrImg" class="qr hidden" alt="QR code">
     <p class="error" id="pairErr"></p>
@@ -386,15 +598,7 @@ img.qr{display:block;margin:10px auto;max-width:260px;background:#fff;padding:8p
 </section>
 <p class="muted">Note : le statut « spamé » n'existe pas côté WhatsApp et ne peut pas être détecté. Le site distingue seulement « disponible » et « introuvable / plus disponible ».</p>
 </div>
-<script>
-var H = { 'Content-Type': 'application/json', 'X-Requested-With': 'verif' };
-function $(id) { return document.getElementById(id); }
-function api(url, method, body) {
-  return fetch(url, { method: method || 'GET', headers: H, body: body ? JSON.stringify(body) : undefined }).then(function (r) { return r.json(); });
-}
-function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-function show(id, on) { $(id).className = $(id).className.replace(' hidden', '').replace('hidden', '').trim() + (on ? '' : ' hidden'); }
-
+<script>${COMMON_JS}
 function card(r, withActions) {
   var d = el('div', 'res ' + r.state);
   d.appendChild(el('div', 'num', r.number));
@@ -418,38 +622,35 @@ function card(r, withActions) {
   }
   return d;
 }
-
 function loadHistory() {
   api('/api/history').then(function (d) {
     var box = $('history'); box.innerHTML = '';
-    if (!d.items || !d.items.length) { box.appendChild(el('p', 'muted', 'Aucun numéro vérifié pour l\\'instant.')); return; }
+    if (!d.items || !d.items.length) { box.appendChild(el('p', 'muted', "Aucun numéro vérifié pour l'instant.")); return; }
     d.items.forEach(function (r) { box.appendChild(card(r, true)); });
   });
 }
-
 function refreshStatus() {
   api('/api/status').then(function (s) {
-    show('demo', s.demo);
+    if (!s || s.status === undefined) return;
+    setHidden('demo', !s.demo); setHidden('eph', !s.ephemeral);
     var b = $('badge');
     if (s.status === 'connected') { b.textContent = 'Connecté'; b.className = 'badge b-ok'; }
     else if (s.status === 'connecting') { b.textContent = 'Connexion…'; b.className = 'badge b-wait'; }
     else { b.textContent = 'Non connecté'; b.className = 'badge b-no'; }
-    show('connOk', s.status === 'connected'); show('connNo', s.status !== 'connected');
+    setHidden('connOk', s.status !== 'connected'); setHidden('connNo', s.status === 'connected');
     $('me').textContent = s.me || ''; $('quota').textContent = s.usedToday + ' / ' + s.dailyLimit;
-    if (s.pairing && s.status !== 'connected') { $('pairCode').textContent = s.pairing; show('pairBox', true); }
-    var q = $('qrImg'); if (s.qr && s.status !== 'connected') { q.src = s.qr; show('qrImg', true); } else show('qrImg', false);
+    if (s.pairing && s.status !== 'connected') { $('pairCode').textContent = s.pairing; setHidden('pairBox', false); } else if (s.status === 'connected') setHidden('pairBox', true);
+    var q = $('qrImg'); if (s.qr && s.status !== 'connected') { q.src = s.qr; setHidden('qrImg', false); } else setHidden('qrImg', true);
   });
 }
-
 $('pairBtn').onclick = function () {
   $('pairErr').textContent = ''; $('pairBtn').disabled = true; $('pairBtn').textContent = 'Patiente…';
   api('/api/pair', 'POST', { phone: $('pairPhone').value }).then(function (d) {
     $('pairBtn').disabled = false; $('pairBtn').textContent = 'Obtenir le code de liaison';
     if (!d.ok) return ($('pairErr').textContent = d.message);
-    $('pairCode').textContent = d.code; show('pairBox', true);
-  });
+    $('pairCode').textContent = d.code; setHidden('pairBox', false);
+  }).catch(function () { $('pairBtn').disabled = false; $('pairBtn').textContent = 'Obtenir le code de liaison'; $('pairErr').textContent = 'Erreur réseau, réessaie.'; });
 };
-
 function check() {
   $('checkErr').textContent = ''; $('results').innerHTML = '';
   var nums = $('nums').value.split(/[\\n,;]+/).map(function (s) { return s.trim(); }).filter(Boolean);
@@ -458,14 +659,15 @@ function check() {
     $('checkBtn').disabled = false; $('checkBtn').textContent = 'Vérifier';
     if (!d.ok) return ($('checkErr').textContent = d.message);
     d.results.forEach(function (r) { $('results').appendChild(card(r, false)); });
+    if (d.warning) $('checkErr').textContent = d.warning;
     loadHistory();
   }).catch(function () { $('checkBtn').disabled = false; $('checkBtn').textContent = 'Vérifier'; $('checkErr').textContent = 'Erreur réseau.'; });
 }
 $('checkBtn').onclick = check;
-
+$('logout').onclick = function () { api('/api/logout', 'POST').then(function () { location.reload(); }); };
 refreshStatus(); loadHistory();
 setInterval(refreshStatus, 4000);
 </script></body></html>`;
 
-app.listen(Number(env.PORT || 3000), () => console.log('Site prêt sur le port ' + (env.PORT || 3000) + (DEMO ? ' (MODE DÉMO)' : '')));
+app.listen(Number(env.PORT || 3000), () => console.log('Site prêt sur le port ' + (env.PORT || 3000) + (DEMO ? ' (MODE DÉMO)' : '') + (REMOTE ? ' (stockage Upstash)' : '')));
 startWA();

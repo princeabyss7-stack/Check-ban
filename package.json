@@ -1,6 +1,6 @@
 {
-  "name": "verif-whatsapp",
-  "version": "1.0.0",
+  "name": "check-ban",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "main": "server.js",
